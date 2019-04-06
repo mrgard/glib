@@ -2161,6 +2161,125 @@ g_socket_bind (GSocket         *socket,
   return TRUE;
 }
 
+ifdef G_OS_WIN32
+static gulong w32_adapter_ipv4_addr(const gchar* name_or_ip)
+{
+  /*
+  * For Windows OS only - return adapter IPv4 address in network byte order.
+  *
+  * Input string can be either friendly name of adapter, IP address of adapter, indextoname, or fullname of adapter
+  * Example:
+  *    192.168.1.109   ===> IP address given directly, convert directly with inet_addr() function
+  *    Wi-Fi           ===> Adapter friendly name "Wi-Fi", scan with GetAdapterAddresses and adapter->FriendlyName
+  *    ethernet_32774  ===> Adapter name as returned by if_indextoname
+  *    {33E8F5CD-BAEA-4214-BE13-B79AB8080CAB} ===> Adaptername, as returned in GetAdapterAddresses and adapter->AdapterName
+  */
+
+  /* Step 1: Check if string is an IP address: */
+  gulong ip_result = inet_addr(name_or_ip);
+  if (ip_result != INADDR_NONE) {
+    /* Success, IP address string (for local Ethernet adapter) was given directly */
+    return ip_result;
+  }
+
+  /*
+  *  Step 2: Check if name represents a valid Interface index (e.g. ethernet_75521)
+  *  function if_nametoindex will return >=1 if a valid index, or 0=no match
+  *  valid index will be used later in GetAdaptersAddress loop for lookup of adapter IP address
+  */
+  NET_IFINDEX if_index = if_nametoindex(name_or_ip);
+
+  /* Step 3: Prepare whcar string for friendly name comparision */
+
+  wchar_t* wchar_name_or_ip = NULL;
+  if (if_index == 0) {
+    /* Name-check only needed if index=0.... */
+    wchar_name_or_ip = (wchar_t*) malloc((strlen(name_or_ip) + 1) * sizeof(wchar_t));
+    if (wchar_name_or_ip) mbstowcs(wchar_name_or_ip, name_or_ip, strlen(name_or_ip) + 1);
+    /* NOTE: Even if malloc fails here, some comparisions can still be done later... so no exit here! */
+  }
+
+
+  /*
+  *  Step 4: Allocate memory and get adapter addresses.
+  *  Buffer allocation loop recommended by MS, since size can be dynamic
+  *  https://docs.microsoft.com/en-us/windows/desktop/api/iphlpapi/nf-iphlpapi-getadaptersaddresses
+  *
+  */
+
+  #define MAX_ALLOC_ITERATIONS 3
+  DWORD ret = ERROR_INSUFFICIENT_BUFFER;
+  DWORD bufsize = 15000;  /* MS-recommended initial bufsize */
+  PIP_ADAPTER_ADDRESSES addr_buf = NULL;
+  int malloc_iterations = 0;
+  do {
+    malloc_iterations++;
+    if (addr_buf) free(addr_buf);
+    addr_buf = (PIP_ADAPTER_ADDRESSES)malloc(bufsize);
+    if (addr_buf) ret = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, NULL, addr_buf, &bufsize);
+  } while (addr_buf && ret == ERROR_INSUFFICIENT_BUFFER && malloc_iterations<MAX_ALLOC_ITERATIONS);
+
+  /* DEBUG: printf("w32_adapter_ipv4_addr, rounds=%d, return size=%ld, ret=%ld\n", malloc_iterations, bufsize, ret); */
+  
+  if (addr_buf == 0 || ret != NO_ERROR) {
+    if (addr_buf) free(addr_buf);
+    if (wchar_name_or_ip) free(wchar_name_or_ip);
+    return INADDR_NONE;
+  }
+
+
+  /* Step 5: Loop through adapters and check match for index or name */
+
+  PIP_ADAPTER_ADDRESSES eth_adapter = addr_buf;
+  while (eth_adapter) {
+    /* Check if match for interface index/name: */
+    gboolean any_match = (if_index>0) && (eth_adapter->IfIndex == if_index);
+
+    /* Check if match for friendly name - but only if NO if_index! */
+    if (!any_match && if_index == 0 && eth_adapter->FriendlyName && eth_adapter->FriendlyName[0] != 0 && wchar_name_or_ip != NULL) {
+      /* NOTE: FriendlyName is PWCHAR */
+      any_match = (_wcsicmp(eth_adapter->FriendlyName, wchar_name_or_ip) == 0);
+    }
+
+    /* Check if match for adapter low level name - but only if NO if_index: */
+    if (!any_match && if_index == 0 && eth_adapter->AdapterName && eth_adapter->AdapterName[0] != 0) {
+      /* AdapterName is PCHAR */
+      any_match = (stricmp(eth_adapter->AdapterName, name_or_ip) == 0);
+    }
+
+    if (any_match) {
+      /* We have match for this adapter, lets get its local unicast IP address! */
+      int uni_count = 0;
+      PIP_ADAPTER_UNICAST_ADDRESS uni_addr = NULL;
+
+      //DWORD dwStrTmp = 1024;
+      //char szTmpBuf[1024];
+      //gboolean bTmpBufOK;
+
+      uni_addr = eth_adapter->FirstUnicastAddress;
+      while (uni_addr) {
+        uni_count++;
+        if (uni_addr->Address.lpSockaddr->sa_family == AF_INET) {
+          ip_result = ((PSOCKADDR_IN)uni_addr->Address.lpSockaddr)->sin_addr.S_un.S_addr;      
+          break; /* finished, exit unicast addr loop */
+        }
+        uni_addr = uni_addr->Next;
+      }
+
+      /* DEBUG: printf("w32_adapter_ipv4_addr, MATCH on index=%ld, name=%s, IP-count=%d\n", eth_adapter->IfIndex, name_or_ip, uni_count); */
+
+      break; /* finished, exit adapters loop */
+    }
+    eth_adapter = eth_adapter->Next;
+  } /* while(eth_adapter) */
+
+  if (addr_buf) free(addr_buf);
+  if (wchar_name_or_ip) free(wchar_name_or_ip);
+  return ip_result;
+}
+#endif   /* #ifdef G_OS_WIN32 */
+
+
 static gboolean
 g_socket_multicast_group_operation (GSocket       *socket,
 				    GInetAddress  *group,
@@ -2198,8 +2317,9 @@ g_socket_multicast_group_operation (GSocket       *socket,
         mc_req.imr_ifindex = 0;  /* Pick any.  */
 #elif defined(G_OS_WIN32)
       if (iface)
-        mc_req.imr_interface.s_addr = g_htonl (if_nametoindex (iface));
-      else
+        /* mc_req.imr_interface.s_addr = g_htonl (if_nametoindex (iface)); Original method, no good...  */
+        mc_req.imr_interface.s_addr = w32_adapter_ipv4_addr(iface);   /* New method */
+      else	
         mc_req.imr_interface.s_addr = g_htonl (INADDR_ANY);
 #else
       mc_req.imr_interface.s_addr = g_htonl (INADDR_ANY);
